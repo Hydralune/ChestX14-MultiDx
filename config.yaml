@@ -1,0 +1,55 @@
+# 胸部X光多标签分类配置文件
+
+# 数据路径
+data:
+  csv_path: "filtered_labels.csv"
+  image_dir: "images"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# 模型配置
+model:
+  name: "EfficientNet-B4"  # 可选: "EfficientNet-B4", "DenseNet121"
+  num_classes: 14
+  pretrained: true
+
+# 训练配置
+train:
+  batch_size: 16
+  num_epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  scheduler: "cosine"  # 可选: "cosine", "step", "none"
+  warmup_epochs: 5
+  
+  # 损失函数
+  loss_type: "weighted_bce"  # 可选: "weighted_bce", "focal_loss"
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  
+  # 混合精度训练
+  mixed_precision: true
+  
+  # Resume训练
+  resume: false
+  resume_checkpoint: ""
+
+# 输入图像配置
+image:
+  size: 512
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+# 保存路径
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  result_dir: "results"
+
+# 设备
+device: "cuda"  # 可选: "cuda", "cpu"
+
+# 随机种子
+seed: 42
+
