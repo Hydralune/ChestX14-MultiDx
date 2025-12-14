@@ -1,6 +1,7 @@
 """
-评估脚本 (High Performance Version)
-支持 EMA 权重加载 + TTA (Test Time Augmentation)
+评估脚本 (Robust Version)
+修复了 ValueError: not enough values to unpack 问题
+兼容旧版 Dataset (2返回值) 和 新版 Dataset (3返回值)
 """
 
 import os
@@ -69,19 +70,16 @@ class Evaluator:
         # 加载权重
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # === 关键修改：智能识别 EMA 权重 ===
+        # 智能识别 EMA 权重
         if 'model_state_dict' in checkpoint:
-            # 这是一个标准的 checkpoint 字典
             state_dict = checkpoint['model_state_dict']
             print("检测到标准 Checkpoint")
             
-            # 如果存在 EMA 状态且不在 best_ema 文件中，尝试加载 EMA
             if 'model_ema_state_dict' in checkpoint:
                 print(">> 注意: 发现 EMA 权重，正在加载 EMA 权重以获得更好性能...")
                 state_dict = checkpoint['model_ema_state_dict']
             
         else:
-            # 这可能是直接保存的 state_dict 或者 best_ema 文件
             state_dict = checkpoint
             print("检测到纯权重文件 (或 EMA 文件)")
 
@@ -114,11 +112,21 @@ class Evaluator:
         with torch.no_grad():
             pbar = tqdm(self.test_loader, desc='评估中')
             
-            for images, labels, names in pbar:
+            # === 修改核心：自动检测 Dataset 返回值的数量 ===
+            for batch in pbar:
+                # 兼容性处理：检查 batch 包含几个元素
+                if len(batch) == 3:
+                    images, labels, names = batch
+                else:
+                    # 如果 Dataset 只返回了 2 个值 (旧版)
+                    images, labels = batch
+                    # 生成占位符文件名
+                    names = ["Unknown_Image"] * len(images)
+                
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                # === TTA (Test Time Augmentation) 核心逻辑 ===
+                # === TTA 逻辑 ===
                 if use_tta:
                     # 1. 原图预测
                     logits_orig = self.model(images)
@@ -134,7 +142,7 @@ class Evaluator:
                 else:
                     logits = self.model(images)
                     probs = torch.sigmoid(logits)
-                # ==========================================
+                # =================
                 
                 probs = probs.cpu().numpy()
                 labels_np = labels.cpu().numpy()
@@ -212,7 +220,6 @@ class Evaluator:
         """绘制ROC曲线"""
         num_classes = len(CLASS_NAMES)
         
-        # 计算每类的ROC曲线
         fig, axes = plt.subplots(4, 4, figsize=(20, 20))
         axes = axes.flatten()
         
@@ -232,24 +239,20 @@ class Evaluator:
                 axes[i].legend(loc="lower right")
                 axes[i].grid(True)
         
-        # 隐藏多余的子图
         for i in range(num_classes, len(axes)):
             axes[i].axis('off')
         
         plt.tight_layout()
         
-        # 保存图像
         roc_path = os.path.join(self.config['paths']['result_dir'], 'roc_curves.png')
         plt.savefig(roc_path, dpi=300, bbox_inches='tight')
         print(f"ROC曲线已保存: {roc_path}")
         plt.close()
         
-        # 绘制平均ROC曲线
         self.plot_mean_roc_curve(labels, probs, class_aucs)
     
     def plot_mean_roc_curve(self, labels, probs, class_aucs):
         """绘制平均ROC曲线"""
-        # 计算macro-average ROC
         all_fpr = np.unique(np.concatenate([
             roc_curve(labels[:, i], probs[:, i])[0] 
             for i in range(len(CLASS_NAMES))
@@ -286,7 +289,6 @@ class Evaluator:
             'Image': names,
         }
         
-        # 添加每类的概率和预测
         for i, class_name in enumerate(CLASS_NAMES):
             results[f'{class_name}_prob'] = probs[:, i]
             results[f'{class_name}_pred'] = (probs[:, i] > 0.5).astype(int)
@@ -305,19 +307,14 @@ def main():
     parser = argparse.ArgumentParser(description='评估模型')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='模型检查点路径')
-    # 默认开启 TTA
     parser.add_argument('--no-tta', action='store_true', help='关闭 TTA')
     
     args = parser.parse_args()
     
-    # 加载配置
     with open('config.yaml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    # 创建评估器
     evaluator = Evaluator(config, args.checkpoint)
-    
-    # 评估 (使用 TTA)
     results = evaluator.evaluate(use_tta=not args.no_tta)
     
     print("\n评估完成!")
