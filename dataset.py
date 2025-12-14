@@ -112,7 +112,10 @@ def get_transforms(image_size=512, is_training=False, mean=None, std=None):
         transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),
+            # 增强旋转范围
+            transforms.RandomRotation(degrees=15), 
+            # 增加平移和缩放
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
@@ -206,7 +209,7 @@ def get_data_loaders(csv_path, image_dir, class_names, image_size=512,
 
 def calculate_pos_weight(csv_path, class_names, patient_ids=None):
     """
-    计算正样本权重，用于处理类别不平衡
+    计算正样本权重，增加平滑处理防止权重过大
     """
     df = pd.read_csv(csv_path)
 
@@ -230,13 +233,23 @@ def calculate_pos_weight(csv_path, class_names, patient_ids=None):
     num_positive = labels.sum(axis=0)
     num_negative = len(labels) - num_positive
 
+    # 防止除零
     num_positive = np.maximum(num_positive, 1)
     num_negative = np.maximum(num_negative, 1)
 
-    pos_weight = num_negative / num_positive
+    # === 修改开始 ===
+    # 原始逻辑（导致权重高达300+）:
+    # pos_weight = num_negative / num_positive
+    
+    # 新逻辑：使用平方根平滑，并限制最大权重为 10 或 15
+    pos_weight = np.sqrt(num_negative / num_positive)
+    
+    # 转换为tensor并截断最大值，防止极度不平衡破坏梯度
+    pos_weight = torch.FloatTensor(pos_weight)
+    pos_weight = torch.clamp(pos_weight, max=10.0) 
+    # === 修改结束 ===
 
-    return torch.FloatTensor(pos_weight)
-
+    return pos_weight
 
 if __name__ == "__main__":
     # 测试数据集
