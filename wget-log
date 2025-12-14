@@ -1,0 +1,4 @@
+--2025-12-14 23:06:42--  https://huggingface.co/
+Resolving huggingface.co (huggingface.co)... 199.96.63.75, 2a03:2880:f12c:83:face:b00c:0:25de
+Connecting to huggingface.co (huggingface.co)|199.96.63.75|:443... failed: Connection timed out.
+Connecting to huggingface.co (huggingface.co)|2a03:2880:f12c:83:face:b00c:0:25de|:443... failed: Network is unreachable.

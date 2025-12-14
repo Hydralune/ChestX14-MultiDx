@@ -169,7 +169,7 @@ class Trainer:
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config["train"]["num_epochs"]} [Train]')
         
-        for images, labels, _ in pbar:
+        for images, labels in pbar:
             images = images.to(self.device)
             labels = labels.to(self.device)
             
@@ -209,7 +209,7 @@ class Trainer:
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc=f'Epoch {epoch+1}/{self.config["train"]["num_epochs"]} [Val]')
             
-            for images, labels, _ in pbar:
+            for images, labels in pbar:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 

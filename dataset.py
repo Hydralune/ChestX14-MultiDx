@@ -33,84 +33,71 @@ CLASS_NAMES = [
 
 
 class ChestXRayDataset(Dataset):
-    """胸部X光多标签分类数据集"""
-    
-    def __init__(self, csv_path, image_dir, class_names, patient_ids, 
+    def __init__(self, csv_path, image_dir, class_names, patient_ids,
                  transform=None, is_training=False):
-        """
-        Args:
-            csv_path: CSV文件路径
-            image_dir: 图像目录
-            class_names: 类别名称列表
-            patient_ids: 包含的患者ID列表
-            transform: 图像变换
-            is_training: 是否为训练集（用于数据增强）
-        """
+
         self.image_dir = image_dir
         self.class_names = class_names
         self.num_classes = len(class_names)
         self.transform = transform
         self.is_training = is_training
-        
-        # 读取CSV文件
+
         df = pd.read_csv(csv_path)
-        
-        # 过滤指定患者的数据
-        self.df = df[df['Patient ID'].isin(patient_ids)].reset_index(drop=True)
-        
-        # 转换为多标签格式
+
+        # 过滤患者
+        df = df[df['Patient ID'].isin(patient_ids)].reset_index(drop=True)
+
+        # === 新增：只保留真实存在的图像 ===
+        existing_images = set(os.listdir(image_dir))
+
+        valid_rows = []
+        for _, row in df.iterrows():
+            if row['Image Index'] in existing_images:
+                valid_rows.append(row)
+
+        self.df = pd.DataFrame(valid_rows).reset_index(drop=True)
+
         self.labels = self._labels_to_multihot(self.df['Finding Labels'].values)
-        
-        print(f"数据集大小: {len(self.df)}, 患者数: {len(patient_ids)}")
-        
+
+        print(f"有效样本数: {len(self.df)} / 原始: {len(df)}")
+
     def _labels_to_multihot(self, label_strings):
         """
         将标签字符串转换为multi-hot向量
         例如: "Cardiomegaly|Effusion" -> [0,1,0,0,1,0,...]
         """
         multihot = np.zeros((len(label_strings), self.num_classes), dtype=np.float32)
-        
+
         for idx, label_str in enumerate(label_strings):
-            if pd.isna(label_str) or label_str.strip() == '':
+            if pd.isna(label_str) or str(label_str).strip() == '':
                 continue
-            
+
             labels = [l.strip() for l in str(label_str).split('|')]
-            
+
             for label in labels:
                 if label == 'No Finding':
-                    # No Finding表示无疾病，所有标签为0
                     continue
                 if label in self.class_names:
                     class_idx = self.class_names.index(label)
                     multihot[idx, class_idx] = 1.0
-        
+
         return multihot
-    
+
+
     def __len__(self):
         return len(self.df)
-    
+
     def __getitem__(self, idx):
-        # 获取图像路径
         image_name = self.df.iloc[idx]['Image Index']
         image_path = os.path.join(self.image_dir, image_name)
-        
-        # 加载图像
-        try:
-            image = Image.open(image_path).convert('RGB')
-        except Exception as e:
-            print(f"加载图像失败: {image_path}, 错误: {e}")
-            # 返回黑色图像
-            image = Image.new('RGB', (512, 512), (0, 0, 0))
-        
-        # 应用变换
+
+        image = Image.open(image_path).convert('RGB')
+
         if self.transform:
             image = self.transform(image)
-        
-        # 获取标签
-        label = torch.FloatTensor(self.labels[idx])
-        
-        return image, label, image_name
 
+        label = torch.FloatTensor(self.labels[idx])
+        return image, label
 
 def get_transforms(image_size=512, is_training=False, mean=None, std=None):
     """
@@ -222,25 +209,32 @@ def calculate_pos_weight(csv_path, class_names, patient_ids=None):
     计算正样本权重，用于处理类别不平衡
     """
     df = pd.read_csv(csv_path)
-    
+
     if patient_ids is not None:
         df = df[df['Patient ID'].isin(patient_ids)]
-    
-    # 转换为多标签
-    dataset = ChestXRayDataset(csv_path, "", class_names, 
-                              df['Patient ID'].unique() if patient_ids is None else patient_ids,
-                              transform=None)
-    
-    labels = dataset.labels
+
+    num_classes = len(class_names)
+    labels = np.zeros((len(df), num_classes), dtype=np.float32)
+
+    for i, label_str in enumerate(df['Finding Labels']):
+        if pd.isna(label_str) or str(label_str).strip() == '':
+            continue
+
+        for label in str(label_str).split('|'):
+            label = label.strip()
+            if label == 'No Finding':
+                continue
+            if label in class_names:
+                labels[i, class_names.index(label)] = 1.0
+
     num_positive = labels.sum(axis=0)
     num_negative = len(labels) - num_positive
-    
-    # 避免除零
-    num_negative = np.maximum(num_negative, 1)
+
     num_positive = np.maximum(num_positive, 1)
-    
+    num_negative = np.maximum(num_negative, 1)
+
     pos_weight = num_negative / num_positive
-    
+
     return torch.FloatTensor(pos_weight)
 
 
