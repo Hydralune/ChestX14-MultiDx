@@ -1,4 +1,4 @@
-# 胸部X光多标签分类配置文件
+# 胸部X光多标签分类配置文件 (High Performance)
 
 # 数据路径
 data:
@@ -10,28 +10,26 @@ data:
 
 # 模型配置
 model:
-  name: "DenseNet121"  # 可选: "EfficientNet-B4", "DenseNet121"
+  name: "DenseNet121"  
   num_classes: 14
   pretrained: true
 
 # 训练配置
 train:
-  batch_size: 16
-  num_epochs: 50
+  batch_size: 16  
+  # 设置为 100，配合早停机制（Early Stopping）使用
+  num_epochs: 100 
   learning_rate: 0.0001
   weight_decay: 0.0001
-  scheduler: "cosine"  # 可选: "cosine", "step", "none"
+  scheduler: "cosine"
   warmup_epochs: 5
   
-  # 损失函数
-  loss_type: "weighted_bce"  # 可选: "weighted_bce", "focal_loss"
+  loss_type: "weighted_bce"
   focal_alpha: 0.25
   focal_gamma: 2.0
   
-  # 混合精度训练
   mixed_precision: true
   
-  # Resume训练
   resume: false
   resume_checkpoint: ""
 
@@ -48,9 +46,7 @@ paths:
   result_dir: "results"
 
 # 设备
-device: "cuda"  # 可选: "cuda", "cpu"
+device: "cuda"
 
-# 随机种子
-seed: 42
-
-
+# 随机种子 (改为一个幸运数字?)
+seed: 2024

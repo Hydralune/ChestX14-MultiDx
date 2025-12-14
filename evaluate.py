@@ -1,6 +1,6 @@
 """
-评估脚本
-支持AUC、F1、ROC曲线、每类AUC计算
+评估脚本 (High Performance Version)
+支持 EMA 权重加载 + TTA (Test Time Augmentation)
 """
 
 import os
@@ -55,10 +55,10 @@ class Evaluator:
         print(f"测试集批次数: {len(self.test_loader)}")
     
     def _load_model(self, checkpoint_path):
-        """加载模型"""
-        print(f"加载模型: {checkpoint_path}")
+        """加载模型 (优先尝试加载 EMA 权重)"""
+        print(f"准备加载模型: {checkpoint_path}")
         
-        # 创建模型
+        # 创建模型架构
         model_config = self.config['model']
         self.model = create_model(
             model_name=model_config['name'],
@@ -68,15 +68,44 @@ class Evaluator:
         
         # 加载权重
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # === 关键修改：智能识别 EMA 权重 ===
+        if 'model_state_dict' in checkpoint:
+            # 这是一个标准的 checkpoint 字典
+            state_dict = checkpoint['model_state_dict']
+            print("检测到标准 Checkpoint")
+            
+            # 如果存在 EMA 状态且不在 best_ema 文件中，尝试加载 EMA
+            if 'model_ema_state_dict' in checkpoint:
+                print(">> 注意: 发现 EMA 权重，正在加载 EMA 权重以获得更好性能...")
+                state_dict = checkpoint['model_ema_state_dict']
+            
+        else:
+            # 这可能是直接保存的 state_dict 或者 best_ema 文件
+            state_dict = checkpoint
+            print("检测到纯权重文件 (或 EMA 文件)")
+
+        # 加载参数
+        try:
+            self.model.load_state_dict(state_dict)
+            print("模型权重加载成功!")
+        except Exception as e:
+            print(f"权重加载警告: {e}")
+            print("尝试处理键名不匹配 (去掉 'module.' 前缀)...")
+            new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            self.model.load_state_dict(new_state_dict)
+            print("修复后加载成功!")
+
         self.model = self.model.to(self.device)
         self.model.eval()
-        
-        print("模型加载完成")
     
-    def evaluate(self):
-        """评估模型"""
-        print("开始评估...")
+    def evaluate(self, use_tta=True):
+        """
+        评估模型
+        Args:
+            use_tta: 是否使用测试时增强 (Test Time Augmentation)
+        """
+        print(f"开始评估... (TTA开启: {use_tta})")
         
         all_probs = []
         all_labels = []
@@ -89,9 +118,25 @@ class Evaluator:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                # 前向传播
-                logits = self.model(images)
-                probs = torch.sigmoid(logits).cpu().numpy()
+                # === TTA (Test Time Augmentation) 核心逻辑 ===
+                if use_tta:
+                    # 1. 原图预测
+                    logits_orig = self.model(images)
+                    probs_orig = torch.sigmoid(logits_orig)
+                    
+                    # 2. 水平翻转预测
+                    images_flip = torch.flip(images, dims=[3])
+                    logits_flip = self.model(images_flip)
+                    probs_flip = torch.sigmoid(logits_flip)
+                    
+                    # 3. 平均
+                    probs = (probs_orig + probs_flip) / 2.0
+                else:
+                    logits = self.model(images)
+                    probs = torch.sigmoid(logits)
+                # ==========================================
+                
+                probs = probs.cpu().numpy()
                 labels_np = labels.cpu().numpy()
                 
                 all_probs.append(probs)
@@ -177,12 +222,12 @@ class Evaluator:
                 roc_auc = class_aucs[i]
                 
                 axes[i].plot(fpr, tpr, color='darkorange', lw=2, 
-                           label=f'ROC (AUC = {roc_auc:.3f})')
+                           label=f'AUC = {roc_auc:.3f}')
                 axes[i].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
                 axes[i].set_xlim([0.0, 1.0])
                 axes[i].set_ylim([0.0, 1.05])
-                axes[i].set_xlabel('False Positive Rate')
-                axes[i].set_ylabel('True Positive Rate')
+                axes[i].set_xlabel('FPR')
+                axes[i].set_ylabel('TPR')
                 axes[i].set_title(f'{CLASS_NAMES[i]}')
                 axes[i].legend(loc="lower right")
                 axes[i].grid(True)
@@ -260,6 +305,9 @@ def main():
     parser = argparse.ArgumentParser(description='评估模型')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='模型检查点路径')
+    # 默认开启 TTA
+    parser.add_argument('--no-tta', action='store_true', help='关闭 TTA')
+    
     args = parser.parse_args()
     
     # 加载配置
@@ -269,12 +317,11 @@ def main():
     # 创建评估器
     evaluator = Evaluator(config, args.checkpoint)
     
-    # 评估
-    results = evaluator.evaluate()
+    # 评估 (使用 TTA)
+    results = evaluator.evaluate(use_tta=not args.no_tta)
     
     print("\n评估完成!")
 
 
 if __name__ == '__main__':
     main()
-

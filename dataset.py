@@ -237,11 +237,7 @@ def calculate_pos_weight(csv_path, class_names, patient_ids=None):
     num_positive = np.maximum(num_positive, 1)
     num_negative = np.maximum(num_negative, 1)
 
-    # === 修改开始 ===
-    # 原始逻辑（导致权重高达300+）:
-    # pos_weight = num_negative / num_positive
-    
-    # 新逻辑：使用平方根平滑，并限制最大权重为 10 或 15
+
     pos_weight = np.sqrt(num_negative / num_positive)
     
     # 转换为tensor并截断最大值，防止极度不平衡破坏梯度

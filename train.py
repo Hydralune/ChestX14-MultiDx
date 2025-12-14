@@ -1,10 +1,11 @@
 """
-训练脚本
-支持混合精度训练、resume训练、保存最优模型、绘制训练曲线
+训练脚本 (High Performance Version)
+集成 Mixup、Model EMA、梯度裁剪、早停机制
 """
 
 import os
 import yaml
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,6 +20,35 @@ from sklearn.metrics import roc_auc_score, f1_score
 from dataset import get_data_loaders, CLASS_NAMES, calculate_pos_weight
 from model import create_model
 from loss import create_loss
+
+
+class ModelEma(nn.Module):
+    """
+    模型指数移动平均 (Exponential Moving Average)
+    这是一种免费的模型集成技术，通常能带来 0.5% - 1.0% 的 AUC 提升。
+    """
+    def __init__(self, model, decay=0.9999, device=None):
+        super(ModelEma, self).__init__()
+        # 深度拷贝原模型
+        self.module = copy.deepcopy(model)
+        self.module.eval()
+        self.decay = decay
+        self.device = device  # perform ema on different device from model if set
+        if self.device is not None:
+            self.module.to(device=device)
+
+    def _update(self, model, update_fn):
+        with torch.no_grad():
+            for ema_v, model_v in zip(self.module.state_dict().values(), model.state_dict().values()):
+                if self.device is not None:
+                    model_v = model_v.to(device=self.device)
+                ema_v.copy_(update_fn(ema_v, model_v))
+
+    def update(self, model):
+        self._update(model, update_fn=lambda e, m: self.decay * e + (1. - self.decay) * m)
+
+    def set(self, model):
+        self._update(model, update_fn=lambda e, m: m)
 
 
 class Trainer:
@@ -43,6 +73,10 @@ class Trainer:
         # 初始化模型
         self._init_model()
         
+        # 初始化 EMA 模型 (新增)
+        print("初始化 EMA 模型...")
+        self.model_ema = ModelEma(self.model, decay=0.999)
+        
         # 初始化损失函数
         self._init_loss()
         
@@ -61,6 +95,10 @@ class Trainer:
         self.val_aucs = []
         self.best_auc = 0.0
         self.start_epoch = 0
+        
+        # 早停机制参数 (新增)
+        self.patience = 8  # 如果8个epoch没提升就停止
+        self.counter = 0
         
         # Resume训练
         if config['train']['resume'] and config['train']['resume_checkpoint']:
@@ -104,6 +142,7 @@ class Trainer:
     def _init_model(self):
         """初始化模型"""
         model_config = self.config['model']
+        print(f"正在创建模型: {model_config['name']} (预训练: {model_config['pretrained']})")
         self.model = create_model(
             model_name=model_config['name'],
             num_classes=model_config['num_classes'],
@@ -131,7 +170,6 @@ class Trainer:
                 focal_alpha=train_config['focal_alpha'],
                 focal_gamma=train_config['focal_gamma']
             )
-        
         print(f"损失函数: {train_config['loss_type']}")
     
     def _init_optimizer(self):
@@ -162,12 +200,15 @@ class Trainer:
             self.scheduler = None
     
     def train_epoch(self, epoch):
-        """训练一个epoch"""
+        """训练一个epoch (集成 Mixup)"""
         self.model.train()
         running_loss = 0.0
         num_batches = 0
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config["train"]["num_epochs"]} [Train]')
+        
+        # Mixup 参数
+        mixup_alpha = 0.2
         
         for images, labels in pbar:
             images = images.to(self.device)
@@ -175,51 +216,87 @@ class Trainer:
             
             self.optimizer.zero_grad()
             
-            # 混合精度训练
+            # === Mixup 逻辑开始 ===
+            use_mixup = False
+            if np.random.random() < 0.5: # 50% 概率使用 Mixup
+                use_mixup = True
+                # 生成 Beta 分布的 lambda
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                # 生成打乱的索引
+                index = torch.randperm(images.size(0)).to(self.device)
+                
+                # 混合图像
+                mixed_images = lam * images + (1 - lam) * images[index]
+                # 混合标签
+                mixed_labels = lam * labels + (1 - lam) * labels[index]
+            # === Mixup 逻辑结束 ===
+            
+            # 混合精度前向传播
             if self.scaler is not None:
                 with autocast():
-                    logits = self.model(images)
-                    loss = self.criterion(logits, labels)
+                    if use_mixup:
+                        logits = self.model(mixed_images)
+                        loss = self.criterion(logits, mixed_labels)
+                    else:
+                        logits = self.model(images)
+                        loss = self.criterion(logits, labels)
                 
                 self.scaler.scale(loss).backward()
+                
+                # 梯度裁剪 (防止新架构梯度爆炸)
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                logits = self.model(images)
-                loss = self.criterion(logits, labels)
+                if use_mixup:
+                    logits = self.model(mixed_images)
+                    loss = self.criterion(logits, mixed_labels)
+                else:
+                    logits = self.model(images)
+                    loss = self.criterion(logits, labels)
+                    
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
+            
+            # 更新 EMA 模型
+            self.model_ema.update(self.model)
             
             running_loss += loss.item()
             num_batches += 1
             
-            # 更新进度条
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         avg_loss = running_loss / num_batches
         return avg_loss
     
-    def validate(self, epoch):
-        """验证"""
-        self.model.eval()
+    def validate(self, epoch, use_ema=True):
+        """验证 (支持使用 EMA 模型验证)"""
+        # 如果使用 EMA，则评估 EMA 模型，否则评估当前模型
+        eval_model = self.model_ema.module if use_ema else self.model
+        eval_model.eval()
+        
         running_loss = 0.0
         all_probs = []
         all_labels = []
         
+        mode_str = "[Val (EMA)]" if use_ema else "[Val]"
+        
         with torch.no_grad():
-            pbar = tqdm(self.val_loader, desc=f'Epoch {epoch+1}/{self.config["train"]["num_epochs"]} [Val]')
+            pbar = tqdm(self.val_loader, desc=f'Epoch {epoch+1} {mode_str}')
             
             for images, labels in pbar:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                # 前向传播
                 if self.scaler is not None:
                     with autocast():
-                        logits = self.model(images)
+                        logits = eval_model(images)
                         loss = self.criterion(logits, labels)
                 else:
-                    logits = self.model(images)
+                    logits = eval_model(images)
                     loss = self.criterion(logits, labels)
                 
                 running_loss += loss.item()
@@ -231,12 +308,10 @@ class Trainer:
                 all_probs.append(probs)
                 all_labels.append(labels_np)
         
-        # 计算指标
         avg_loss = running_loss / len(self.val_loader)
         all_probs = np.concatenate(all_probs, axis=0)
         all_labels = np.concatenate(all_labels, axis=0)
         
-        # AUC（macro和micro）
         try:
             auc_macro = roc_auc_score(all_labels, all_probs, average='macro')
             auc_micro = roc_auc_score(all_labels, all_probs, average='micro')
@@ -244,7 +319,6 @@ class Trainer:
             auc_macro = 0.0
             auc_micro = 0.0
         
-        # F1（macro和micro）
         preds = (all_probs > 0.5).astype(int)
         f1_macro = f1_score(all_labels, preds, average='macro', zero_division=0)
         f1_micro = f1_score(all_labels, preds, average='micro', zero_division=0)
@@ -252,10 +326,11 @@ class Trainer:
         return avg_loss, auc_macro, auc_micro, f1_macro, f1_micro
     
     def save_checkpoint(self, epoch, is_best=False):
-        """保存检查点"""
+        """保存检查点 (同时保存 EMA 状态)"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
+            'model_ema_state_dict': self.model_ema.module.state_dict(), # 保存 EMA
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
@@ -280,7 +355,19 @@ class Trainer:
                 'checkpoint_best.pth'
             )
             torch.save(checkpoint, best_path)
-            print(f"保存最佳模型 (AUC: {self.best_auc:.4f})")
+            # 同时也保存一个 EMA 版本的最佳权重（通常这是最好的）
+            best_ema_path = os.path.join(
+                self.config['paths']['checkpoint_dir'],
+                'checkpoint_best_ema.pth'
+            )
+            torch.save({
+                'model_state_dict': self.model_ema.module.state_dict(),
+                'config': self.config,
+                'epoch': epoch,
+                'auc': self.best_auc
+            }, best_ema_path)
+            
+            print(f"保存最佳模型 (AUC: {self.best_auc:.4f}) [EMA 版本已保存]")
     
     def _load_checkpoint(self, checkpoint_path):
         """加载检查点"""
@@ -289,6 +376,11 @@ class Trainer:
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # 尝试加载 EMA
+        if 'model_ema_state_dict' in checkpoint:
+            self.model_ema.module.load_state_dict(checkpoint['model_ema_state_dict'])
+            print("EMA 状态已恢复")
         
         if self.scheduler and checkpoint['scheduler_state_dict']:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -310,7 +402,7 @@ class Trainer:
         
         # 损失曲线
         axes[0].plot(self.train_losses, label='Train Loss', marker='o')
-        axes[0].plot(self.val_losses, label='Val Loss', marker='s')
+        axes[0].plot(self.val_losses, label='Val Loss (EMA)', marker='s')
         axes[0].set_xlabel('Epoch')
         axes[0].set_ylabel('Loss')
         axes[0].set_title('Training and Validation Loss')
@@ -318,7 +410,7 @@ class Trainer:
         axes[0].grid(True)
         
         # AUC曲线
-        axes[1].plot(self.val_aucs, label='Val AUC (Macro)', marker='o', color='green')
+        axes[1].plot(self.val_aucs, label='Val AUC (EMA Macro)', marker='o', color='green')
         axes[1].set_xlabel('Epoch')
         axes[1].set_ylabel('AUC')
         axes[1].set_title('Validation AUC')
@@ -339,13 +431,14 @@ class Trainer:
         
         print("开始训练...")
         print(f"总epochs: {num_epochs}, 从epoch {self.start_epoch}开始")
+        print("已启用: Mixup 数据增强, Model EMA, 梯度裁剪, 早停机制")
         
         for epoch in range(self.start_epoch, num_epochs):
-            # 训练
+            # 训练 (带 Mixup)
             train_loss = self.train_epoch(epoch)
             
-            # 验证
-            val_loss, auc_macro, auc_micro, f1_macro, f1_micro = self.validate(epoch)
+            # 验证 (使用 EMA 模型，通常性能更好)
+            val_loss, auc_macro, auc_micro, f1_macro, f1_micro = self.validate(epoch, use_ema=True)
             
             # 更新学习率
             if self.scheduler:
@@ -359,18 +452,14 @@ class Trainer:
             # TensorBoard记录
             current_lr = self.optimizer.param_groups[0]['lr']
             self.writer.add_scalar('Loss/Train', train_loss, epoch)
-            self.writer.add_scalar('Loss/Val', val_loss, epoch)
-            self.writer.add_scalar('AUC/Val_Macro', auc_macro, epoch)
-            self.writer.add_scalar('AUC/Val_Micro', auc_micro, epoch)
-            self.writer.add_scalar('F1/Val_Macro', f1_macro, epoch)
-            self.writer.add_scalar('F1/Val_Micro', f1_micro, epoch)
+            self.writer.add_scalar('Loss/Val_EMA', val_loss, epoch)
+            self.writer.add_scalar('AUC/Val_Macro_EMA', auc_macro, epoch)
             self.writer.add_scalar('LR', current_lr, epoch)
             
             # 打印信息
             print(f"Epoch {epoch+1}/{num_epochs}")
-            print(f"  Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-            print(f"  Val AUC (Macro): {auc_macro:.4f}, Val AUC (Micro): {auc_micro:.4f}")
-            print(f"  Val F1 (Macro): {f1_macro:.4f}, Val F1 (Micro): {f1_micro:.4f}")
+            print(f"  Train Loss: {train_loss:.4f}, Val Loss (EMA): {val_loss:.4f}")
+            print(f"  Val AUC (Macro EMA): {auc_macro:.4f}")
             print(f"  LR: {current_lr:.6f}")
             print("-" * 60)
             
@@ -378,31 +467,32 @@ class Trainer:
             is_best = auc_macro > self.best_auc
             if is_best:
                 self.best_auc = auc_macro
+                self.counter = 0 # 重置早停计数器
+            else:
+                self.counter += 1
+                print(f"早停计数: {self.counter}/{self.patience}")
             
             self.save_checkpoint(epoch, is_best=is_best)
+            
+            # 早停
+            if self.counter >= self.patience:
+                print(f"验证集性能在 {self.patience} 个 epoch 内未提升，停止训练。")
+                break
         
         # 绘制训练曲线
         self.plot_training_curves()
-        
-        # 关闭TensorBoard
         self.writer.close()
-        
         print(f"训练完成! 最佳AUC: {self.best_auc:.4f}")
 
 
 def main():
     """主函数"""
-    # 加载配置
     with open('config.yaml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    # 创建训练器
     trainer = Trainer(config)
-    
-    # 开始训练
     trainer.train()
 
 
 if __name__ == '__main__':
     main()
-
