@@ -1,6 +1,4 @@
 """
-胸部X光多标签分类数据集
-支持患者级划分、多标签转换、数据增强
 """
 
 import os
@@ -103,20 +101,24 @@ def get_transforms(image_size=512, is_training=False, mean=None, std=None):
     """
     获取数据增强变换
     """
+    # === 移除ImageNet归一化 ===
+    # 医学X光图像归一化: 将[0, 255]映射到[-1, 1]
+    # 使用mean=0.5, std=0.5相当于 (x/255.0 - 0.5) / 0.5 = (x - 127.5) / 127.5
+    # 这样可以将[0, 255]映射到[-1, 1]范围
     if mean is None:
-        mean = [0.485, 0.456, 0.406]
+        mean = [0.5, 0.5, 0.5]  # 灰度图像的统一归一化值（3通道相同）
     if std is None:
-        std = [0.229, 0.224, 0.225]
+        std = [0.5, 0.5, 0.5]   # 标准差0.5，实现[-1, 1]归一化
     
     if is_training:
         transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.RandomHorizontalFlip(p=0.5),
-            # 增强旋转范围
-            transforms.RandomRotation(degrees=15), 
-            # 增加平移和缩放
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            # 适度的几何变换（保留医学图像的空间结构）
+            transforms.RandomRotation(degrees=10),  # 减小旋转角度，避免破坏病灶结构
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),  # 减小变换幅度
+            # 保留轻微的亮度对比度调整（模拟不同设备的成像差异）
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),  # 减小扰动幅度
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])

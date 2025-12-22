@@ -1,6 +1,4 @@
 """
-训练脚本 (High Performance Version)
-集成 Mixup、Model EMA、梯度裁剪、早停机制
 """
 
 import os
@@ -156,21 +154,32 @@ class Trainer:
         print(f"模型参数量 - 总数: {total_params:,}, 可训练: {trainable_params:,}")
     
     def _init_loss(self):
-        """初始化损失函数"""
+        """初始化损失函数（SOTA版本）"""
         train_config = self.config['train']
+        loss_type = train_config.get('loss_type', 'asymmetric_loss')  # 默认使用ASL
         
-        if train_config['loss_type'] == 'weighted_bce':
+        if loss_type == 'weighted_bce':
             self.criterion = create_loss(
                 loss_type='weighted_bce',
                 pos_weight=self.pos_weight
             )
-        else:
+        elif loss_type == 'focal_loss':
             self.criterion = create_loss(
                 loss_type='focal_loss',
-                focal_alpha=train_config['focal_alpha'],
-                focal_gamma=train_config['focal_gamma']
+                focal_alpha=train_config.get('focal_alpha', 0.25),
+                focal_gamma=train_config.get('focal_gamma', 2.0)
             )
-        print(f"损失函数: {train_config['loss_type']}")
+        elif loss_type == 'asymmetric_loss':
+            # ASL Loss (SOTA损失函数，适合多标签医学影像)
+            self.criterion = create_loss(
+                loss_type='asymmetric_loss',
+                asl_gamma_pos=train_config.get('asl_gamma_pos', 1.0),
+                asl_gamma_neg=train_config.get('asl_gamma_neg', 4.0),
+                asl_clip=train_config.get('asl_clip', 0.05)
+            )
+        else:
+            raise ValueError(f"不支持的损失类型: {loss_type}")
+        print(f"损失函数: {loss_type} (SOTA: Asymmetric Loss推荐用于多标签医学影像)")
     
     def _init_optimizer(self):
         """初始化优化器和调度器"""
@@ -200,15 +209,19 @@ class Trainer:
             self.scheduler = None
     
     def train_epoch(self, epoch):
-        """训练一个epoch (集成 Mixup)"""
+        """
+        训练一个epoch
+        
+        【SOTA改进 - 移除Mixup】
+        - Mixup会破坏医学图像中的局部病灶结构（如小病灶、边界清晰的病变）
+        - 对AUC（排序指标）不利，因为混合后的标签是soft的，破坏了hard label的排序信息
+        - 预期提升: +0.01~0.02 AUC（通过保留真实的病灶结构）
+        """
         self.model.train()
         running_loss = 0.0
         num_batches = 0
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config["train"]["num_epochs"]} [Train]')
-        
-        # Mixup 参数
-        mixup_alpha = 0.2
         
         for images, labels in pbar:
             images = images.to(self.device)
@@ -216,30 +229,12 @@ class Trainer:
             
             self.optimizer.zero_grad()
             
-            # === Mixup 逻辑开始 ===
-            use_mixup = False
-            if np.random.random() < 0.5: # 50% 概率使用 Mixup
-                use_mixup = True
-                # 生成 Beta 分布的 lambda
-                lam = np.random.beta(mixup_alpha, mixup_alpha)
-                # 生成打乱的索引
-                index = torch.randperm(images.size(0)).to(self.device)
-                
-                # 混合图像
-                mixed_images = lam * images + (1 - lam) * images[index]
-                # 混合标签
-                mixed_labels = lam * labels + (1 - lam) * labels[index]
-            # === Mixup 逻辑结束 ===
-            
+            # === 直接使用真实样本，不使用Mixup ===
             # 混合精度前向传播
             if self.scaler is not None:
                 with autocast():
-                    if use_mixup:
-                        logits = self.model(mixed_images)
-                        loss = self.criterion(logits, mixed_labels)
-                    else:
-                        logits = self.model(images)
-                        loss = self.criterion(logits, labels)
+                    logits = self.model(images)
+                    loss = self.criterion(logits, labels)
                 
                 self.scaler.scale(loss).backward()
                 
@@ -250,12 +245,8 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                if use_mixup:
-                    logits = self.model(mixed_images)
-                    loss = self.criterion(logits, mixed_labels)
-                else:
-                    logits = self.model(images)
-                    loss = self.criterion(logits, labels)
+                logits = self.model(images)
+                loss = self.criterion(logits, labels)
                     
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
@@ -431,10 +422,10 @@ class Trainer:
         
         print("开始训练...")
         print(f"总epochs: {num_epochs}, 从epoch {self.start_epoch}开始")
-        print("已启用: Mixup 数据增强, Model EMA, 梯度裁剪, 早停机制")
+        print("已启用: Model EMA, 梯度裁剪, 早停机制 (Mixup已移除，适合医学图像)")
         
         for epoch in range(self.start_epoch, num_epochs):
-            # 训练 (带 Mixup)
+            # 训练 (不使用Mixup，保持医学图像的真实结构)
             train_loss = self.train_epoch(epoch)
             
             # 验证 (使用 EMA 模型，通常性能更好)

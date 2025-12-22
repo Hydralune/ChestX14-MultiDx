@@ -1,7 +1,4 @@
 """
-评估脚本 (Robust Version)
-修复了 ValueError: not enough values to unpack 问题
-兼容旧版 Dataset (2返回值) 和 新版 Dataset (3返回值)
 """
 
 import os
@@ -156,42 +153,54 @@ class Evaluator:
         all_labels = np.concatenate(all_labels, axis=0)
         
         # 计算整体指标
-        print("\n" + "="*60)
-        print("整体评估结果")
-        print("="*60)
+        print("\n" + "="*70)
+        print("整体评估结果 (SOTA评估标准)")
+        print("="*70)
         
-        # AUC
+        # === 优先计算每类的AUC（用于Macro AUC计算）===
+        class_aucs = []
+        print("\n【每类AUC详细结果】")
+        print("-" * 70)
+        for i, class_name in enumerate(CLASS_NAMES):
+            try:
+                class_auc = roc_auc_score(all_labels[:, i], all_probs[:, i])
+                class_aucs.append(class_auc)
+                print(f"  {class_name:25s}: {class_auc:.4f}")
+            except:
+                class_aucs.append(0.0)
+                print(f"  {class_name:25s}: N/A (无正样本)")
+        
+        # === 计算Macro和Micro AUC ===
+        print("\n" + "-" * 70)
         try:
-            auc_macro = roc_auc_score(all_labels, all_probs, average='macro')
+            # Macro AUC: 每类AUC的平均值（SOTA标准指标）
+            auc_macro = np.mean([auc for auc in class_aucs if auc > 0])  # 排除N/A的类别
+            # 同时使用sklearn验证
+            auc_macro_sklearn = roc_auc_score(all_labels, all_probs, average='macro')
+            auc_macro = auc_macro_sklearn  # 使用sklearn的官方实现
+            
+            # Micro AUC: 所有样本合并计算的AUC
             auc_micro = roc_auc_score(all_labels, all_probs, average='micro')
-            print(f"AUC (Macro): {auc_macro:.4f}")
-            print(f"AUC (Micro): {auc_micro:.4f}")
+            
+            # === 重点强调Macro AUC（SOTA评估标准）===
+            print(f"\n【主要指标 - Macro AUC】: {auc_macro:.4f} ⭐")
+            print(f"  说明: Macro AUC是多标签分类的SOTA评估标准，")
+            print(f"        对每个类别等权重，更能反映模型在rare class上的性能")
+            print(f"\n【辅助指标 - Micro AUC】: {auc_micro:.4f}")
+            print(f"  说明: Micro AUC对所有样本等权重，受常见类别影响较大")
         except Exception as e:
             print(f"AUC计算错误: {e}")
             auc_macro = 0.0
             auc_micro = 0.0
         
-        # F1
+        # F1 Score（辅助指标）
         preds = (all_probs > 0.5).astype(int)
         f1_macro = f1_score(all_labels, preds, average='macro', zero_division=0)
         f1_micro = f1_score(all_labels, preds, average='micro', zero_division=0)
-        print(f"F1 (Macro): {f1_macro:.4f}")
-        print(f"F1 (Micro): {f1_micro:.4f}")
-        
-        # 计算每类的AUC
-        print("\n" + "="*60)
-        print("每类AUC结果")
-        print("="*60)
-        
-        class_aucs = []
-        for i, class_name in enumerate(CLASS_NAMES):
-            try:
-                class_auc = roc_auc_score(all_labels[:, i], all_probs[:, i])
-                class_aucs.append(class_auc)
-                print(f"{class_name:20s}: {class_auc:.4f}")
-            except:
-                class_aucs.append(0.0)
-                print(f"{class_name:20s}: N/A (无正样本)")
+        print(f"\n【辅助指标 - F1 Score】")
+        print(f"  F1 (Macro): {f1_macro:.4f}")
+        print(f"  F1 (Micro): {f1_micro:.4f}")
+        print("="*70)
         
         # 保存结果到CSV
         results_df = pd.DataFrame({
