@@ -9,16 +9,65 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast as autocast_new
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, f1_score
+import copy
 
-from dataset import get_data_loaders, CLASS_NAMES, calculate_pos_weight
+from dataset import get_data_loaders, CLASS_NAMES, calculate_pos_weight, mixup_data, mixup_criterion
 from model import create_model
 from loss import create_loss
 from metrics import calculate_metrics
 from utils import set_seed, load_config, save_checkpoint, load_checkpoint, create_logger
+
+
+class ModelEMA:
+    """指数移动平均模型，用于提升模型性能"""
+    def __init__(self, model, decay=0.9999, device=None):
+        """
+        Args:
+            model: 要平滑的模型
+            decay: EMA衰减率
+            device: 设备
+        """
+        self.model = model
+        self.decay = decay
+        self.device = device
+        self.shadow = {}
+        self.backup = {}
+        self.register()
+
+    def register(self):
+        """注册模型参数"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        """更新EMA参数"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        """应用EMA参数到模型"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        """恢复原始参数"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
 
 
 class Trainer:
@@ -49,8 +98,26 @@ class Trainer:
         # 初始化优化器和调度器
         self._init_optimizer()
         
+        # 初始化EMA
+        ema_decay = config['train'].get('ema_decay', 0.9999)
+        self.use_ema = config['train'].get('use_ema', True)
+        if self.use_ema:
+            self.ema = ModelEMA(self.model, decay=ema_decay, device=self.device)
+            print(f"启用EMA，衰减率: {ema_decay}")
+        else:
+            self.ema = None
+        
         # 初始化混合精度训练
         self.scaler = GradScaler() if config['train']['mixed_precision'] else None
+        
+        # 梯度累积步数
+        self.accumulation_steps = config['train'].get('gradient_accumulation_steps', 1)
+        
+        # Mixup配置
+        self.use_mixup = config['train'].get('use_mixup', False)
+        self.mixup_alpha = config['train'].get('mixup_alpha', 0.2)
+        if self.use_mixup:
+            print(f"启用Mixup数据增强，alpha: {self.mixup_alpha}")
         
         # TensorBoard
         self.writer = create_logger(config['paths']['log_dir'])
@@ -98,13 +165,16 @@ class Trainer:
     def _init_model(self):
         """初始化模型"""
         model_config = self.config['model']
+        image_config = self.config['image']
         print(f"正在创建模型: {model_config['name']} (预训练: {model_config['pretrained']})")
         print(f"输入通道模式: {model_config.get('input_channel_mode', 'expand')}")
         
         self.model = create_model(
             num_classes=model_config['num_classes'],
             pretrained=model_config['pretrained'],
-            input_channel_mode=model_config.get('input_channel_mode', 'expand')
+            input_channel_mode=model_config.get('input_channel_mode', 'expand'),
+            img_size=image_config['size'],
+            model_size=model_config.get('model_size', 'tiny')
         )
         self.model = self.model.to(self.device)
         
@@ -116,19 +186,38 @@ class Trainer:
     def _init_loss(self):
         """初始化损失函数"""
         train_config = self.config['train']
+        loss_type = train_config['loss_type']
         
-        if train_config['loss_type'] == 'weighted_bce':
+        if loss_type == 'weighted_bce':
             self.criterion = create_loss(
                 loss_type='weighted_bce',
                 pos_weight=self.pos_weight
             )
-        else:
+        elif loss_type == 'focal_loss':
             self.criterion = create_loss(
                 loss_type='focal_loss',
-                focal_alpha=train_config['focal_alpha'],
-                focal_gamma=train_config['focal_gamma']
+                focal_alpha=train_config.get('focal_alpha', 0.25),
+                focal_gamma=train_config.get('focal_gamma', 2.0)
             )
-        print(f"损失函数: {train_config['loss_type']}")
+        elif loss_type == 'asymmetric_loss':
+            self.criterion = create_loss(
+                loss_type='asymmetric_loss',
+                asymmetric_gamma_neg=train_config.get('asymmetric_gamma_neg', 4),
+                asymmetric_gamma_pos=train_config.get('asymmetric_gamma_pos', 1),
+                asymmetric_clip=train_config.get('asymmetric_clip', 0.05)
+            )
+        elif loss_type == 'combined':
+            self.criterion = create_loss(
+                loss_type='combined',
+                pos_weight=self.pos_weight,
+                asymmetric_gamma_neg=train_config.get('asymmetric_gamma_neg', 4),
+                asymmetric_gamma_pos=train_config.get('asymmetric_gamma_pos', 1),
+                asymmetric_clip=train_config.get('asymmetric_clip', 0.05),
+                combined_alpha=train_config.get('combined_alpha', 0.5)
+            )
+        else:
+            raise ValueError(f"不支持的损失类型: {loss_type}")
+        print(f"损失函数: {loss_type}")
     
     def _init_optimizer(self):
         """初始化优化器和调度器"""
@@ -143,11 +232,22 @@ class Trainer:
         
         # 学习率调度器
         if train_config['scheduler'] == 'cosine':
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=train_config['num_epochs'],
-                eta_min=1e-6
-            )
+            # Cosine Annealing with Warmup
+            warmup_epochs = train_config.get('warmup_epochs', 5)
+            total_epochs = train_config['num_epochs']
+            eta_min = train_config.get('eta_min', 1e-6)
+            
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    # Warmup: 线性增长
+                    return epoch / warmup_epochs
+                else:
+                    # Cosine annealing
+                    progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+                    return eta_min / train_config['learning_rate'] + (1 - eta_min / train_config['learning_rate']) * 0.5 * (1 + np.cos(np.pi * progress))
+            
+            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+            print(f"使用Cosine Annealing调度器，Warmup: {warmup_epochs} epochs")
         elif train_config['scheduler'] == 'linear':
             # Linear warmup + linear decay
             warmup_epochs = train_config.get('warmup_epochs', 5)
@@ -169,39 +269,89 @@ class Trainer:
         running_loss = 0.0
         num_batches = 0
         
+        # 梯度累积相关
+        self.optimizer.zero_grad()
+        
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.config["train"]["num_epochs"]} [Train]')
         
-        for images, labels in pbar:
+        for batch_idx, (images, labels) in enumerate(pbar):
             images = images.to(self.device)
             labels = labels.to(self.device)
             
-            self.optimizer.zero_grad()
+            # Mixup数据增强
+            if self.use_mixup and np.random.rand() < 0.5:  # 50%概率使用Mixup
+                images, labels_a, labels_b, lam = mixup_data(images, labels, self.mixup_alpha)
+                use_mixup = True
+            else:
+                labels_a, labels_b, lam = labels, labels, 1.0
+                use_mixup = False
             
             # 混合精度前向传播
             if self.scaler is not None:
-                with autocast():
+                # 使用新的autocast API避免警告
+                with autocast_new('cuda', enabled=True):
                     logits = self.model(images)
-                    loss = self.criterion(logits, labels)
+                    if use_mixup:
+                        loss = mixup_criterion(self.criterion, logits, labels_a, labels_b, lam)
+                    else:
+                        loss = self.criterion(logits, labels)
+                    # 梯度累积：除以累积步数
+                    loss = loss / self.accumulation_steps
                 
                 self.scaler.scale(loss).backward()
+                
+                # 梯度累积：每accumulation_steps步更新一次
+                if (batch_idx + 1) % self.accumulation_steps == 0:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+                    
+                    # 更新EMA
+                    if self.ema is not None:
+                        self.ema.update()
+            else:
+                with autocast_new('cuda', enabled=False):
+                    logits = self.model(images)
+                    if use_mixup:
+                        loss = mixup_criterion(self.criterion, logits, labels_a, labels_b, lam)
+                    else:
+                        loss = self.criterion(logits, labels)
+                    loss = loss / self.accumulation_steps
+                
+                loss.backward()
+                
+                if (batch_idx + 1) % self.accumulation_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    
+                    if self.ema is not None:
+                        self.ema.update()
+            
+            running_loss += loss.item() * self.accumulation_steps
+            num_batches += 1
+            
+            pbar.set_postfix({'loss': f'{loss.item() * self.accumulation_steps:.4f}'})
+        
+        # 处理最后一个不完整的batch
+        if len(self.train_loader) % self.accumulation_steps != 0:
+            if self.scaler is not None:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                logits = self.model(images)
-                loss = self.criterion(logits, labels)
-                loss.backward()
                 self.optimizer.step()
-            
-            running_loss += loss.item()
-            num_batches += 1
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            self.optimizer.zero_grad()
+            if self.ema is not None:
+                self.ema.update()
         
         avg_loss = running_loss / num_batches
         return avg_loss
     
     def validate(self, epoch):
         """验证"""
+        # 使用EMA模型进行验证
+        if self.ema is not None:
+            self.ema.apply_shadow()
+        
         self.model.eval()
         
         running_loss = 0.0
@@ -216,12 +366,13 @@ class Trainer:
                 labels = labels.to(self.device)
                 
                 if self.scaler is not None:
-                    with autocast():
+                    with autocast_new('cuda', enabled=True):
                         logits = self.model(images)
                         loss = self.criterion(logits, labels)
                 else:
-                    logits = self.model(images)
-                    loss = self.criterion(logits, labels)
+                    with autocast_new('cuda', enabled=False):
+                        logits = self.model(images)
+                        loss = self.criterion(logits, labels)
                 
                 running_loss += loss.item()
                 
@@ -231,6 +382,10 @@ class Trainer:
                 
                 all_probs.append(probs)
                 all_labels.append(labels_np)
+        
+        # 恢复原始模型参数
+        if self.ema is not None:
+            self.ema.restore()
         
         avg_loss = running_loss / len(self.val_loader)
         all_probs = np.concatenate(all_probs, axis=0)
@@ -353,7 +508,13 @@ class Trainer:
             if is_best:
                 self.best_auc = auc_macro
             
-            self.save_checkpoint(epoch, is_best=is_best)
+            # 保存检查点时，如果使用EMA，保存EMA模型
+            if is_best and self.ema is not None:
+                self.ema.apply_shadow()
+                self.save_checkpoint(epoch, is_best=is_best)
+                self.ema.restore()
+            else:
+                self.save_checkpoint(epoch, is_best=is_best)
         
         # 绘制训练曲线
         self.plot_training_curves()

@@ -116,3 +116,6 @@ if __name__ == "__main__":
     for i, class_name in enumerate(CLASS_NAMES):
         print(f"  {class_name:20s}: {class_aucs[i]:.4f}")
 
+
+
+

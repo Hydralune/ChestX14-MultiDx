@@ -64,10 +64,13 @@ class Evaluator:
         
         # 创建模型架构
         model_config = self.config['model']
+        image_config = self.config['image']
         self.model = create_model(
             num_classes=model_config['num_classes'],
             pretrained=False,
-            input_channel_mode=model_config.get('input_channel_mode', 'expand')
+            input_channel_mode=model_config.get('input_channel_mode', 'expand'),
+            img_size=image_config['size'],
+            model_size=model_config.get('model_size', 'tiny')
         )
         
         # 加载权重

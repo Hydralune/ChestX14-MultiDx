@@ -74,7 +74,7 @@ class ChestXRayDataset(Dataset):
 
 
 def get_transforms(image_size=512, is_training=False, mean=None, std=None, 
-                   input_channel_mode='expand'):
+                   input_channel_mode='expand', use_mixup=False, mixup_alpha=0.2):
     """
     获取数据增强变换
     
@@ -86,6 +86,8 @@ def get_transforms(image_size=512, is_training=False, mean=None, std=None,
         input_channel_mode: 输入通道处理方式
             - "expand": 将灰度图扩展到3通道（复制3次）
             - "modify": 保持1通道（需要模型第一层适配）
+        use_mixup: 是否使用Mixup（需要在DataLoader层面实现）
+        mixup_alpha: Mixup的alpha参数（Beta分布的参数）
     """
     if mean is None:
         mean = [0.485, 0.456, 0.406]
@@ -123,6 +125,50 @@ def get_transforms(image_size=512, is_training=False, mean=None, std=None,
     
     transform = transforms.Compose(transform_list)
     return transform
+
+
+def mixup_data(x, y, alpha=1.0):
+    """
+    Mixup数据增强
+    
+    Args:
+        x: 输入图像 (B, C, H, W)
+        y: 标签 (B, num_classes)
+        alpha: Beta分布的参数
+    
+    Returns:
+        mixed_x: 混合后的图像
+        y_a, y_b: 两个原始标签
+        lam: 混合系数
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """
+    计算Mixup损失
+    
+    Args:
+        criterion: 损失函数
+        pred: 模型预测
+        y_a, y_b: 两个标签
+        lam: 混合系数
+    
+    Returns:
+        loss: 混合损失
+    """
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
 def split_by_patient(df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_state=42):
@@ -288,4 +334,7 @@ if __name__ == "__main__":
     print(f"图像形状: {images.shape}")
     print(f"标签形状: {labels.shape}")
     print(f"标签示例: {labels[0]}")
+
+
+
 
