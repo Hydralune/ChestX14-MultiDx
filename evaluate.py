@@ -35,6 +35,11 @@ class Evaluator:
         """初始化数据加载器"""
         data_config = self.config['data']
         image_config = self.config['image']
+
+        clahe_config = image_config.get('clahe', {})
+        use_clahe = clahe_config.get('enabled', False)
+        clahe_clip_limit = clahe_config.get('clip_limit', 2.0)
+        clahe_tile_grid_size = clahe_config.get('tile_grid_size', 8)
         
         _, _, self.test_loader = get_data_loaders(
             csv_path=data_config['csv_path'],
@@ -47,7 +52,10 @@ class Evaluator:
             test_ratio=data_config['test_ratio'],
             mean=image_config['mean'],
             std=image_config['std'],
-            random_state=self.config.get('seed', 42)
+            random_state=self.config.get('seed', 42),
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_tile_grid_size=clahe_tile_grid_size
         )
         
         print(f"测试集批次数: {len(self.test_loader)}")

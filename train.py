@@ -114,6 +114,11 @@ class Trainer:
         """初始化数据加载器"""
         data_config = self.config['data']
         image_config = self.config['image']
+
+        clahe_config = image_config.get('clahe', {})
+        use_clahe = clahe_config.get('enabled', False)
+        clahe_clip_limit = clahe_config.get('clip_limit', 2.0)
+        clahe_tile_grid_size = clahe_config.get('tile_grid_size', 8)
         
         self.train_loader, self.val_loader, self.test_loader = get_data_loaders(
             csv_path=data_config['csv_path'],
@@ -126,7 +131,10 @@ class Trainer:
             test_ratio=data_config['test_ratio'],
             mean=image_config['mean'],
             std=image_config['std'],
-            random_state=self.config.get('seed', 42)
+            random_state=self.config.get('seed', 42),
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_tile_grid_size=clahe_tile_grid_size
         )
         
         # 计算pos_weight（仅使用训练集）
@@ -363,10 +371,32 @@ class Trainer:
     def _load_checkpoint(self, checkpoint_path):
         """加载检查点"""
         print(f"加载检查点: {checkpoint_path}")
+        if not os.path.exists(checkpoint_path):
+            print(f"检查点不存在，跳过恢复训练: {checkpoint_path}")
+            return
+
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except RuntimeError as e:
+            print("检查点与当前模型结构不兼容，跳过恢复训练。")
+            print(f"不兼容原因: {e}")
+            try:
+                incompatible = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                missing = len(incompatible.missing_keys)
+                unexpected = len(incompatible.unexpected_keys)
+                print(f"已尝试 non-strict 部分加载权重 (missing={missing}, unexpected={unexpected})")
+            except Exception as e2:
+                print(f"non-strict 部分加载也失败: {e2}")
+
+            self.start_epoch = 0
+            self.best_auc = 0.0
+            self.train_losses = []
+            self.val_losses = []
+            self.val_aucs = []
+            return
         
         # 尝试加载 EMA
         if 'model_ema_state_dict' in checkpoint:

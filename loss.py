@@ -145,43 +145,34 @@ class AsymmetricLoss(nn.Module):
         Returns:
             loss: 损失值
         """
-        # 计算概率（数值稳定）
-        probs = torch.sigmoid(logits)
-        
-        # 分离positive和negative样本
-        targets_pos = targets
-        targets_neg = 1 - targets
-        
-        # === Positive Loss: (1-p)^gamma_pos * log(p) ===
-        # 使用clamp确保数值稳定
-        probs_pos = probs * targets_pos
-        probs_pos = torch.clamp(probs_pos, min=self.eps, max=1.0 - self.eps)
-        
-        # Focal weight for positive
-        focal_weight_pos = torch.pow(1 - probs_pos, self.gamma_pos)
-        # BCE for positive
-        bce_pos = -torch.log(probs_pos)
-        # ASL for positive
-        loss_pos = self.alpha * focal_weight_pos * bce_pos * targets_pos
-        
-        # === Negative Loss: p^gamma_neg * log(1-p) if p < clip ===
-        probs_neg = probs * targets_neg
-        # 应用clip机制：只对p < clip的negative样本计算损失
-        # 这抑制了easy negative的梯度（p接近0的样本）
-        probs_neg = torch.clamp(probs_neg, min=self.eps, max=1.0 - self.eps)
-        
-        # Focal weight for negative
-        focal_weight_neg = torch.pow(probs_neg, self.gamma_neg)
-        # BCE for negative
-        bce_neg = -torch.log(1 - probs_neg)
-        # ASL for negative (with clip threshold)
-        # 只计算概率小于clip阈值的negative样本
-        mask_neg = (probs_neg < self.clip).float()
-        loss_neg = focal_weight_neg * bce_neg * targets_neg * mask_neg
-        
-        # 总损失
-        loss = loss_pos + loss_neg
-        
+        # 计算概率
+        xs_pos = torch.sigmoid(logits)
+        xs_neg = 1.0 - xs_pos
+
+        # ASL clipping: increase negative probability to suppress easy negatives
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+
+        # log-prob (numerically stable)
+        log_pos = torch.log(xs_pos.clamp(min=self.eps))
+        log_neg = torch.log(xs_neg.clamp(min=self.eps))
+
+        # base CE for multi-label
+        loss = targets * log_pos + (1.0 - targets) * log_neg
+
+        # asymmetric focusing
+        if self.gamma_pos > 0 or self.gamma_neg > 0:
+            pt = xs_pos * targets + xs_neg * (1.0 - targets)
+            gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+            loss = loss * torch.pow(1.0 - pt, gamma)
+
+        # optional alpha balancing
+        if self.alpha != 1.0:
+            alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+            loss = loss * alpha_t
+
+        loss = -loss
+
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':

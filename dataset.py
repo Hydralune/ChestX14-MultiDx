@@ -4,6 +4,7 @@
 import os
 import pandas as pd
 import numpy as np
+import cv2
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -32,13 +33,17 @@ CLASS_NAMES = [
 
 class ChestXRayDataset(Dataset):
     def __init__(self, csv_path, image_dir, class_names, patient_ids,
-                 transform=None, is_training=False):
+                 transform=None, is_training=False,
+                 use_clahe=False, clahe_clip_limit=2.0, clahe_tile_grid_size=8):
 
         self.image_dir = image_dir
         self.class_names = class_names
         self.num_classes = len(class_names)
         self.transform = transform
         self.is_training = is_training
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_grid_size = clahe_tile_grid_size
 
         df = pd.read_csv(csv_path)
 
@@ -90,6 +95,17 @@ class ChestXRayDataset(Dataset):
         image_path = os.path.join(self.image_dir, image_name)
 
         image = Image.open(image_path).convert('RGB')
+
+        if self.use_clahe:
+            img_np = np.array(image)
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            clahe = cv2.createCLAHE(
+                clipLimit=float(self.clahe_clip_limit),
+                tileGridSize=(int(self.clahe_tile_grid_size), int(self.clahe_tile_grid_size))
+            )
+            gray = clahe.apply(gray)
+            img_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            image = Image.fromarray(img_np)
 
         if self.transform:
             image = self.transform(image)
@@ -159,7 +175,8 @@ def split_by_patient(df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, rando
 
 def get_data_loaders(csv_path, image_dir, class_names, image_size=512, 
                      batch_size=16, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,
-                     mean=None, std=None, num_workers=4, random_state=42):
+                     mean=None, std=None, num_workers=4, random_state=42,
+                     use_clahe=False, clahe_clip_limit=2.0, clahe_tile_grid_size=8):
     """
     获取数据加载器
     """
@@ -175,19 +192,28 @@ def get_data_loaders(csv_path, image_dir, class_names, image_size=512,
     train_dataset = ChestXRayDataset(
         csv_path, image_dir, class_names, train_patients,
         transform=get_transforms(image_size, is_training=True, mean=mean, std=std),
-        is_training=True
+        is_training=True,
+        use_clahe=use_clahe,
+        clahe_clip_limit=clahe_clip_limit,
+        clahe_tile_grid_size=clahe_tile_grid_size
     )
     
     val_dataset = ChestXRayDataset(
         csv_path, image_dir, class_names, val_patients,
         transform=get_transforms(image_size, is_training=False, mean=mean, std=std),
-        is_training=False
+        is_training=False,
+        use_clahe=use_clahe,
+        clahe_clip_limit=clahe_clip_limit,
+        clahe_tile_grid_size=clahe_tile_grid_size
     )
     
     test_dataset = ChestXRayDataset(
         csv_path, image_dir, class_names, test_patients,
         transform=get_transforms(image_size, is_training=False, mean=mean, std=std),
-        is_training=False
+        is_training=False,
+        use_clahe=use_clahe,
+        clahe_clip_limit=clahe_clip_limit,
+        clahe_tile_grid_size=clahe_tile_grid_size
     )
     
     # 创建数据加载器
