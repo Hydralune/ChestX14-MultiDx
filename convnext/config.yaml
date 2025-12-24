@@ -1,0 +1,76 @@
+# ConvNeXt Large 训练配置文件
+
+# 数据路径（相对于项目根目录）
+data:
+  csv_path: "filtered_labels.csv"
+  image_dir: "images"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# 模型配置
+model:
+  name: "convnext_large"  # ConvNeXt Large模型
+  num_classes: 14
+  pretrained: true  # 使用ImageNet预训练权重
+
+
+train:
+  # 总batch size = 128，每个GPU约32
+  batch_size: 128
+  
+  # Epochs - 配合早停机制使用
+  num_epochs: 100
+  
+  # 学习率 - ConvNeXt Large需要较小的学习率
+  learning_rate: 0.0001
+  
+  # 权重衰减
+  weight_decay: 0.0001
+  
+  # 学习率调度器
+  scheduler: "cosine_warmup"  # Cosine Annealing with Warmup (SOTA)
+  warmup_epochs: 5  # Warmup轮数
+  min_lr: 1e-6  # 最小学习率
+  
+  # 损失函数 - 使用ASL (SOTA损失函数)
+  loss_type: "asymmetric_loss"
+  asl_gamma_pos: 1.0  # Positive样本的focal参数
+  asl_gamma_neg: 4.0  # Negative样本的focal参数（抑制easy negative）
+  asl_clip: 0.05  # Negative样本的概率阈值
+  
+  # EMA (Exponential Moving Average) - SOTA模型集成技术
+  ema_decay: 0.999  # EMA衰减率
+  
+  # 早停机制
+  patience: 10  # 如果10个epoch没提升就停止
+  
+  # 混合精度训练 - 使用FP16加速训练，同时保持高精度
+  mixed_precision: true
+  
+  # 数据加载器workers数量（4卡4090可以支持更多workers）
+  num_workers: 16
+  
+  # Resume训练
+  resume: false
+  resume_checkpoint: ""
+
+# 输入图像配置
+image:
+  size: 512  # 输入图像尺寸（512x512适合ConvNeXt Large）
+  # 医学X光图像归一化：将[0, 255]映射到[-1, 1]
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+
+# 保存路径（相对于convnext文件夹）
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  result_dir: "results"
+
+# 设备
+device: "cuda"
+
+# 随机种子
+seed: 2024
+
